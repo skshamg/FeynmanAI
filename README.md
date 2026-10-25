@@ -36,9 +36,6 @@ FeynmanAI decouples conversational pedagogy from evaluation logic using a dual-a
         +-----------------------+-----------------------+
         |                                               |
         v                                               v
-
-```
-
 +-----------------------+                       +-----------------------+
 |     Agent 1: Alex     |                       |   Agent 2: Evaluator  |
 |  (Inquisitive Peer)   |                       |  (Pedagogy Analyzer)  |
