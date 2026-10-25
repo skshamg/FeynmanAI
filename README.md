@@ -1,5 +1,3 @@
-In VS Code, create a new file named `README.md` in the root of your `FeynmanAI` folder, paste the entire content below, and save it (`Ctrl + S`):
-
 ```markdown
 # 🎓 FeynmanAI: Socratic Inversion Engine
 
