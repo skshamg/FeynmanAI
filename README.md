@@ -26,7 +26,7 @@ FeynmanAI decouples conversational pedagogy from evaluation logic using a dual-a
 
 ```
 
-```
+
               +-----------------------------------+
               |        Student (Teacher UI)       |
               +-----------------+-----------------+
