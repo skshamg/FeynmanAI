@@ -4,7 +4,7 @@ import time
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from google.genai.errors import ServerError
+from google.genai.errors import ClientError, ServerError
 import streamlit as st
 
 # 1. Load API Key & Setup Client
@@ -34,110 +34,98 @@ if "tutor_history" not in st.session_state:
 if "comprehension_score" not in st.session_state:
     st.session_state.comprehension_score = 15
 if "feedback" not in st.session_state:
-    st.session_state.feedback = "Session started. Alex is waiting for your opening explanation."
+    st.session_state.feedback = "Session started. Alex is ready."
 if "celebrated" not in st.session_state:
     st.session_state.celebrated = False
 
-# 4. Agent Prompts
-ALEX_SYSTEM_INSTRUCTION = """
-You are Alex, an inquisitive and slightly confused high school student trying to learn a STEM concept.
-The user is your teacher using the Feynman Technique.
+# 4. Resilient Multi-Model Priority List
+# If primary hits high-demand (503), it immediately rolls over to the next candidate
+CANDIDATE_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.1-pro-preview",
+    "gemini-3.5-flash",
+]
 
-Rules for Alex:
-1. Speak informally and concisely (maximum 2-3 sentences per turn).
-2. Never act like an AI or an all-knowing assistant. You are a curious peer.
-3. Express realistic intuitive misconceptions (e.g., 'Wait, why is orbital energy negative? Does that mean an electron in n=1 has less than zero energy?').
-4. Ask one sharp question that forces the teacher to clarify the physical intuition behind the equations or concepts.
-"""
+def robust_generate(contents, config):
+    """Executes call across candidates with backoff retry, eliminating 503 stalls."""
+    last_err = None
+    for model_name in CANDIDATE_MODELS:
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config,
+                )
+                return response
+            except ServerError as e:
+                last_err = e
+                time.sleep(1.5)  # Brief buffer for transient traffic spikes
+            except ClientError as e:
+                # If model is retired or 404 for this key, switch candidate immediately
+                last_err = e
+                break
+            except Exception as e:
+                last_err = e
+                break
+    raise RuntimeError(f"All candidate endpoints busy or unavailable: {last_err}")
 
-TUTOR_SYSTEM_INSTRUCTION = """
-You are an expert, encouraging STEM professor and mentor in the style of Richard Feynman.
-The user is asking you for explanations, formula derivations, intuition, or quick conceptual brainstorming.
-Format mathematical equations cleanly using standard LaTeX enclosed in $ or $$.
-Be clear, intuitive, and concise. Avoid unnecessary preamble.
-"""
+# Single Prompt: Alex + Evaluator in one shot
+FAST_FEYNMAN_PROMPT = """
+You are a dual-engine AI for the Feynman Technique:
+1. "alex_reply": You play Alex, an inquisitive high school peer. Respond concisely (maximum 2-3 sentences). Express realistic intuitive misconceptions. Ask a sharp question testing physical intuition.
+2. "comprehension_score": An integer (0 to 100) scoring how well the user just explained the concept.
+3. "feedback": One short sentence diagnosing their explanation (e.g., noting jargon or praising analogies).
 
-EVALUATOR_SYSTEM_INSTRUCTION = """
-You are an expert pedagogy evaluator for STEM subjects.
-Analyze the user's explanation to Alex and return ONLY a valid JSON object.
-
-Format strictly as:
+Return ONLY a valid JSON object matching this schema:
 {
-  "comprehension_score": <integer from 0 to 100>,
-  "feedback": "<one concise sentence diagnosing the user's explanation or noting jargon>"
+  "alex_reply": "string",
+  "comprehension_score": 50,
+  "feedback": "string"
 }
 """
 
-ACTIVE_MODEL = "gemini-3.8-flash"
+TUTOR_PROMPT = """
+You are Richard Feynman. Explain STEM concepts simply with intuitive physical analogies and clean LaTeX equations. Keep it concise.
+"""
 
-def call_gemini_with_retry(contents, config, max_retries=3):
-    """Retries cleanly if Google's servers experience a temporary 503 spike."""
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model=ACTIVE_MODEL,
-                contents=contents,
-                config=config,
-            )
-            return response
-        except ServerError as e:
-            if attempt < max_retries - 1:
-                time.sleep(2)
-            else:
-                raise e
+def execute_fast_feynman(topic, history, user_input, current_score):
+    """Executes conversational reply and pedagogy evaluation in a single fast call with failover."""
+    prompt = f"""
+    Target Topic: {topic}
+    Current Score: {current_score}%
+    
+    Recent Chat Context:
+    """
+    for msg in history[-4:]:
+        prompt += f"{msg['role']}: {msg['content']}\n"
+    prompt += f"User (Teacher): {user_input}\n"
 
-def generate_alex_response(topic, history, user_input):
-    """Generates Alex's conversational response with inquisitive misconceptions."""
-    conversation_context = f"Topic: {topic}\n\nRecent Dialogue:\n"
-    for msg in history[-6:]:
-        conversation_context += f"{msg['role']}: {msg['content']}\n"
-    conversation_context += f"User (Teacher): {user_input}\nAlex:"
-
-    response = call_gemini_with_retry(
-        contents=conversation_context,
+    response = robust_generate(
+        contents=prompt,
         config=types.GenerateContentConfig(
-            system_instruction=ALEX_SYSTEM_INSTRUCTION,
-            temperature=0.7,
-        ),
-    )
-    return response.text.strip()
-
-def generate_tutor_response(topic, history, user_input):
-    """Generates standard mentor/tutor assistance."""
-    conversation_context = f"Topic: {topic}\n\nRecent Dialogue:\n"
-    for msg in history[-6:]:
-        conversation_context += f"{msg['role']}: {msg['content']}\n"
-    conversation_context += f"User: {user_input}\nTutor:"
-
-    response = call_gemini_with_retry(
-        contents=conversation_context,
-        config=types.GenerateContentConfig(
-            system_instruction=TUTOR_SYSTEM_INSTRUCTION,
+            system_instruction=FAST_FEYNMAN_PROMPT,
+            response_mime_type="application/json",
             temperature=0.4,
         ),
     )
-    return response.text.strip()
+    return json.loads(response.text)
 
-def evaluate_explanation(topic, user_input, current_score):
-    """Silently scores the user's explanation and updates the comprehension meter."""
-    prompt = f"""
-    Topic: {topic}
-    Current Comprehension Score: {current_score}%
-    Latest User Explanation: "{user_input}"
-    
-    If the explanation uses intuitive analogies or clarifies underlying mechanics, increase the score.
-    If it is vague, purely memorized jargon, or logically wrong, lower the score slightly or keep it unchanged.
-    """
-    response = call_gemini_with_retry(
-        contents=prompt,
+def generate_tutor_response(topic, history, user_input):
+    """Fast mentor mode response with failover."""
+    context = f"Topic: {topic}\n"
+    for msg in history[-4:]:
+        context += f"{msg['role']}: {msg['content']}\n"
+    context += f"User: {user_input}"
+
+    response = robust_generate(
+        contents=context,
         config=types.GenerateContentConfig(
-            system_instruction=EVALUATOR_SYSTEM_INSTRUCTION,
-            response_mime_type="application/json",
-            temperature=0.2,
+            system_instruction=TUTOR_PROMPT,
+            temperature=0.3,
         ),
     )
-    data = json.loads(response.text)
-    return data.get("comprehension_score", current_score), data.get("feedback", "Explanation processed.")
+    return response.text.strip()
 
 def generate_markdown_summary(topic, score, history):
     """Compiles the session into a clean study summary document."""
@@ -151,12 +139,12 @@ def generate_markdown_summary(topic, score, history):
     doc += "---\n*Generated by FeynmanAI Socratic Inversion Engine*\n"
     return doc
 
-# 5. UI Layout: Sidebar (HUD & State)
+# 5. UI Layout: Sidebar HUD
 with st.sidebar:
     st.header("🎛️ Session Controls")
     input_topic = st.text_input(
         "Enter Concept to Teach:",
-        placeholder="e.g. Bohr's Model & de Broglie Wavelength",
+        placeholder="e.g. Newton's Third Law & Conservation of Momentum",
     )
     
     if st.button("Start New Session", use_container_width=True):
@@ -177,10 +165,9 @@ with st.sidebar:
     st.markdown("**Pedagogical Feedback:**")
     st.info(st.session_state.feedback)
 
-# 6. UI Layout: Main Stage (Classroom)
+# 6. UI Layout: Main Stage
 st.title("🎓 FeynmanAI Studio")
 
-# Mode Selector
 mode = st.radio(
     "Active Mode:",
     ["🧠 Feynman Inversion Mode (Teach Alex)", "💡 Standard Tutor / Brainstorm Mode"],
@@ -195,15 +182,13 @@ else:
     if "Feynman Inversion" in mode:
         st.caption("You are the Teacher. Alex is your student. Explain the intuition behind the concept.")
 
-        # Mastery Completion Banner & Export Button
+        # 90%+ Mastery Celebration & Export
         if st.session_state.comprehension_score >= 90:
             if not st.session_state.celebrated:
                 st.balloons()
                 st.session_state.celebrated = True
+            st.success("🎉 **Mastery Achieved!** Alex has fully understood the core conceptual mechanics.")
             
-            st.success("🎉 **Mastery Achieved!** Alex has fully understood the core conceptual mechanics of this topic.")
-            
-            # Prepare file download
             summary_text = generate_markdown_summary(
                 st.session_state.topic,
                 st.session_state.comprehension_score,
@@ -219,8 +204,7 @@ else:
                 use_container_width=True,
             )
             st.markdown("---")
-        
-        # Render Feynman dialogue history
+
         for message in st.session_state.chat_history:
             with st.chat_message(message["role"]):
                 st.write(message["content"])
@@ -233,29 +217,30 @@ else:
 
             with st.spinner("Alex is thinking..."):
                 try:
-                    alex_reply = generate_alex_response(
-                        st.session_state.topic, st.session_state.chat_history, user_input
+                    data = execute_fast_feynman(
+                        st.session_state.topic,
+                        st.session_state.chat_history,
+                        user_input,
+                        st.session_state.comprehension_score,
                     )
+                    
+                    st.session_state.comprehension_score = data.get("comprehension_score", st.session_state.comprehension_score)
+                    st.session_state.feedback = data.get("feedback", "Explanation evaluated.")
+                    
+                    alex_reply = data.get("alex_reply", "I'm still thinking about that...")
                     st.session_state.chat_history.append({"role": "assistant", "content": alex_reply})
-
-                    new_score, feedback = evaluate_explanation(
-                        st.session_state.topic, user_input, st.session_state.comprehension_score
-                    )
-                    st.session_state.comprehension_score = new_score
-                    st.session_state.feedback = feedback
                     st.rerun()
                 except Exception as e:
                     st.error(f"Execution Error: {e}")
 
     else:
-        st.caption("You are studying. Ask the AI Tutor to explain formulas, derivations, or practice questions.")
+        st.caption("Ask questions, practice derivations, or review concepts.")
         
-        # Render Tutor dialogue history
         for message in st.session_state.tutor_history:
             with st.chat_message(message["role"]):
                 st.write(message["content"])
 
-        tutor_input = st.chat_input("Ask a doubt or request a derivation...")
+        tutor_input = st.chat_input("Ask the Tutor...")
         if tutor_input:
             st.session_state.tutor_history.append({"role": "user", "content": tutor_input})
             with st.chat_message("user"):
