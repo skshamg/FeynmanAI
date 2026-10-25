@@ -24,7 +24,7 @@ Traditional AI study tools act as automated answer keys. Students passively prom
 FeynmanAI decouples conversational pedagogy from evaluation logic using a dual-agent architecture:
 
 
-```
+
 
 
               +-----------------------------------+
@@ -54,6 +54,8 @@ v
 |  - Dynamic Comprehension Meter    |
 |  - LaTeX Formula Typography       |
 +-----------------------------------+
+
+
 
 ```
 
